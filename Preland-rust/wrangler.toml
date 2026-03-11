@@ -1,0 +1,20 @@
+name = "preland-redirect"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-03-06"
+workers_dev = false
+
+routes = [
+  { pattern = "comedownl.shop/*", zone_name = "comedownl.shop" }
+]
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[d1_databases]]
+binding = "analytics_db"
+database_name = "analytics-db"
+database_id = "f2dc4931-14b1-435d-874a-4ceea3a35f27"
+
+[vars]
+FB_PIXEL_ID = "926011889947758"
+TG_BOT = "HDevaBot"
