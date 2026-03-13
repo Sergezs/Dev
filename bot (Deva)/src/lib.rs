@@ -13,6 +13,7 @@ struct Update {
 
 #[derive(Deserialize)]
 struct TgMessage {
+    message_id: i64,
     chat: Chat,
     from: Option<From>,
     text: Option<String>,
@@ -49,7 +50,15 @@ struct InlineKeyboardMarkup {
 #[derive(Serialize)]
 struct InlineKeyboardButton {
     text: String,
-    url:  String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_app: Option<WebAppInfo>,
+}
+
+#[derive(Serialize)]
+struct WebAppInfo {
+    url: String,
 }
 
 // ── Точка входа Worker'а ─────────────────────────────────────────────────────
@@ -82,17 +91,22 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
                     console_error!("handle_start error: {e}");
                 }
             });
-        } else if !text.is_empty() {
-            // Любое другое сообщение — отправляем security check
-            // (на случай если человек написал что-то вручную без /start)
+        } else if !text.is_empty() && !text.starts_with("/start") {
+            // Любое другое сообщение — проверяем верификацию, если не прошёл — шлём check
             ctx.wait_until(async move {
                 let tg_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
                 if tg_id != 0 {
                     let preland = env.var("PRELAND_URL").map(|v| v.to_string())
-                        .unwrap_or_else(|_| "https://comedownl.shop".to_string());
-                    let first_name = msg.from.as_ref().map(|u| u.first_name.clone()).unwrap_or_default();
-                    let username = msg.from.as_ref().and_then(|u| u.username.as_deref()).map(|s| s.to_string()).unwrap_or_default();
-                    let _ = send_security_check(&token, msg.chat.id, tg_id, &preland, &first_name, &username).await;
+                        .unwrap_or_default();
+                    let analytics_key = env.secret("ANALYTICS_KEY").map(|v| v.to_string()).unwrap_or_default();
+                    let (verified, _) = check_verified(&preland, tg_id, &analytics_key).await;
+                    if !verified {
+                        let first_name = msg.from.as_ref().map(|u| u.first_name.clone()).unwrap_or_default();
+                        let username = msg.from.as_ref().and_then(|u| u.username.as_deref()).map(|s| s.to_string()).unwrap_or_default();
+                        let _ = send_security_check(&token, msg.chat.id, tg_id, &preland, &first_name, &username).await;
+                    } else {
+                        let _ = handle_start(&env, &token, &msg).await;
+                    }
                 }
             });
         }
@@ -101,9 +115,33 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
     Response::ok("")
 }
 
+
+// check_verified — проверяет есть ли tg_id в таблице tg_links на сайте
+// Возвращает (verified, ok_mid) — ok_mid это message_id сообщения "проверка пройдена"
+async fn check_verified(preland: &str, tg_id: i64, analytics_key: &str) -> (bool, i64) {
+    let api_url = format!("{}/api/tg_check?tg_id={}&key={}", preland, tg_id, analytics_key);
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    if let Ok(req) = Request::new_with_init(&api_url, &init) {
+        if let Ok(mut resp) = Fetch::Request(req).send().await {
+            if resp.status_code() == 200 {
+                if let Ok(text) = resp.text().await {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let verified = val.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let ok_mid = val.get("ok_mid").and_then(|v| v.as_i64()).unwrap_or(0);
+                        return (verified, ok_mid);
+                    }
+                }
+            }
+        }
+    }
+    (false, 0)
+}
+
 // ── Обработчик /start ────────────────────────────────────────────────────────
 
 async fn handle_start(env: &Env, token: &str, msg: &TgMessage) -> Result<()> {
+    let msg_id = msg.message_id;
     let name = match &msg.from {
         Some(u) => {
             let mut n = html_escape(&u.first_name);
@@ -129,22 +167,30 @@ async fn handle_start(env: &Env, token: &str, msg: &TgMessage) -> Result<()> {
 
     let tg_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
     let preland = env.var("PRELAND_URL").map(|v| v.to_string())
-        .unwrap_or_else(|_| "https://comedownl.shop".to_string());
+        .unwrap_or_default();
+    let analytics_key = env.secret("ANALYTICS_KEY").map(|v| v.to_string()).unwrap_or_default();
 
     // Если /start без параметра — проверяем прошёл ли юзер проверку (есть ли в tg_links)
     if start_param.is_empty() && tg_id != 0 {
-        let verified = check_verified(&preland, tg_id).await;
+        let (verified, ok_mid) = check_verified(&preland, tg_id, &analytics_key).await;
         if !verified {
             let first_name = msg.from.as_ref().map(|u| u.first_name.as_str()).unwrap_or("друг");
             let username = msg.from.as_ref().and_then(|u| u.username.as_deref()).unwrap_or("");
+            // Удаляем сообщение /start пользователя
+            delete_message(token, msg.chat.id, msg_id).await;
             send_security_check(token, msg.chat.id, tg_id, &preland, first_name, username).await?;
             return Ok(());
+        }
+        // Удаляем сообщение /start и сообщение "проверка пройдена"
+        delete_message(token, msg.chat.id, msg_id).await;
+        if ok_mid > 0 {
+            delete_message(token, msg.chat.id, ok_mid).await;
         }
         // Уже прошёл проверку — показываем основное сообщение (без analytics_link)
     } else if !start_param.is_empty() {
         // start_param — числовой vid с рекламы
         if let Some(user) = &msg.from {
-            analytics_link(start_param, user).await;
+            analytics_link(start_param, user, &preland, &analytics_key).await;
         }
     }
 
@@ -168,10 +214,8 @@ async fn handle_start(env: &Env, token: &str, msg: &TgMessage) -> Result<()> {
 
 // ── Security check (показывается когда vid пустой) ───────────────────────────
 
-async fn send_security_check(token: &str, chat_id: i64, tg_id: i64, preland: &str, first_name: &str, username: &str) -> Result<()> {
-    // Сначала отправляем сообщение без mid чтобы получить message_id
-    let verify_url = format!("{}/?tg={}&n={}&u={}&mid=0", preland, tg_id, encode(first_name), encode(username));
-
+async fn send_security_check(token: &str, chat_id: i64, _tg_id: i64, preland: &str, _first_name: &str, _username: &str) -> Result<()> {
+    let webapp_url = format!("{}/app", preland);
     #[derive(Serialize)]
     struct Msg {
         chat_id:      i64,
@@ -179,48 +223,27 @@ async fn send_security_check(token: &str, chat_id: i64, tg_id: i64, preland: &st
         parse_mode:   &'static str,
         reply_markup: InlineKeyboardMarkup,
     }
-
     let payload = Msg {
         chat_id,
         text: "🔐 <b>Проверка безопасности</b>\n\nДля доступа необходимо подтвердить, что вы не робот.\n\n<i>Нажмите кнопку ниже — это займёт секунду.</i>",
         parse_mode: "HTML",
         reply_markup: InlineKeyboardMarkup {
-            inline_keyboard: vec![vec![btn("✅ Я не робот — продолжить", verify_url)]],
+            inline_keyboard: vec![vec![btn_webapp("✅ Я не робот — продолжить", webapp_url)]],
         },
     };
-    let mid = tg_post_id(token, "sendMessage", &serde_json::to_string(&payload)?).await?;
-
-    if mid > 0 {
-        // Редактируем кнопку — подставляем реальный mid в URL
-        let verify_url2 = format!("{}/?tg={}&n={}&u={}&mid={}", preland, tg_id, encode(first_name), encode(username), mid);
-        #[derive(Serialize)]
-        struct EditMsg {
-            chat_id:      i64,
-            message_id:   i64,
-            reply_markup: InlineKeyboardMarkup,
-        }
-        let edit = EditMsg {
-            chat_id,
-            message_id: mid,
-            reply_markup: InlineKeyboardMarkup {
-                inline_keyboard: vec![vec![btn("✅ Я не робот — продолжить", verify_url2)]],
-            },
-        };
-        let _ = tg_post(token, "editMessageReplyMarkup", &serde_json::to_string(&edit)?).await;
-    }
-
+    tg_post(token, "sendMessage", &serde_json::to_string(&payload)?).await?;
     Ok(())
 }
 
 // ── Analytics link helper ─────────────────────────────────────────────────────
 
-async fn analytics_link(vid: &str, user: &From) {
+async fn analytics_link(vid: &str, user: &From, preland: &str, analytics_key: &str) {
     let tg_name = match &user.last_name {
         Some(last) => format!("{} {}", user.first_name, last),
         None       => user.first_name.clone(),
     };
     let body = json!({
-        "key":      "21njKadew4ufFuejfbfvjr",
+        "key":      analytics_key,
         "vid":      vid,
         "tg_id":    user.id,
         "tg_user":  user.username.as_deref().unwrap_or(""),
@@ -232,7 +255,8 @@ async fn analytics_link(vid: &str, user: &From) {
     init.with_method(Method::Post)
         .with_headers(headers)
         .with_body(Some(JsValue::from_str(&body)));
-    if let Ok(req) = Request::new_with_init("https://comedownl.shop/api/tg", &init) {
+    let api_tg_url = format!("{}/api/tg", preland);
+    if let Ok(req) = Request::new_with_init(&api_tg_url, &init) {
         let _ = Fetch::Request(req).send().await;
     }
 }
@@ -273,8 +297,21 @@ async fn tg_post_id(token: &str, method: &str, body: &str) -> Result<i64> {
 
 // ── Утилиты ──────────────────────────────────────────────────────────────────
 
+async fn delete_message(token: &str, chat_id: i64, message_id: i64) {
+    #[derive(Serialize)]
+    struct DelMsg { chat_id: i64, message_id: i64 }
+    if let Ok(body) = serde_json::to_string(&DelMsg { chat_id, message_id }) {
+        let _ = tg_post(token, "deleteMessage", &body).await;
+    }
+}
+
+
 fn btn(text: &str, url: String) -> InlineKeyboardButton {
-    InlineKeyboardButton { text: text.to_string(), url }
+    InlineKeyboardButton { text: text.to_string(), url: Some(url), web_app: None }
+}
+
+fn btn_webapp(text: &str, url: String) -> InlineKeyboardButton {
+    InlineKeyboardButton { text: text.to_string(), url: None, web_app: Some(WebAppInfo { url }) }
 }
 
 fn html_escape(s: &str) -> String {

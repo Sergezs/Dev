@@ -1,14 +1,14 @@
 use worker::*;
 use serde::{Deserialize, Serialize, Deserializer};
-use sha2::{Sha256, Digest};
+use sha2::Sha256;
+use hmac::{Hmac, Mac};
+type HmacSha256 = Hmac<Sha256>;
 use std::collections::HashMap;
 use wasm_bindgen::JsValue;
 
 // ── Константы (Constants) ─────────────────────────────────────────────────────
 // Секретный ключ для API запросов к /api/stats, /api/purchase, /api/tg
-const ANALYTICS_KEY: &str = "21njKadew4ufFuejfbfvjr";
 // Соль для хэширования IP адресов (чтобы не хранить реальные IP)
-const SALT: &str = "cd-salt-x9k2m";
 // Логин и пароль для входа в дашборд /analytics — хранятся в секретах Cloudflare (DASH_LOGIN, DASH_PASS)
 
 // ── Вспомогательные парсеры (Helper parsers) ──────────────────────────────────
@@ -205,14 +205,74 @@ struct ApiResp {
 
 // ── Утилиты (Utilities) ───────────────────────────────────────────────────────
 
-// hash_ip — хэширует IP + соль через SHA256, берёт первые 6 байт
-// Нужно чтобы не хранить реальные IP адреса пользователей
-fn hash_ip(ip: &str) -> String {
+// hash_ip — хэширует IP + соль через SHA256, берёт первые 8 байт
+fn hash_ip(ip: &str, salt: &str) -> String {
+    use sha2::Digest;
     let mut h = Sha256::new();
     h.update(ip);
-    h.update(SALT);
-    hex::encode(&h.finalize()[..6])
+    h.update(salt);
+    hex::encode(&h.finalize()[..8])
 }
+
+// verify_webapp_init_data — проверяет подпись initData от Telegram Mini App
+fn verify_webapp_init_data(init_data: &str, bot_token: &str) -> bool {
+    // Парсим hash из initData
+    let hash = init_data.split('&').find_map(|part| {
+        part.strip_prefix("hash=").map(|v| v.to_string())
+    }).unwrap_or_default();
+    if hash.is_empty() { return false; }
+
+    // Собираем data_check_string — все поля кроме hash, отсортированные, через 
+
+    let mut parts: Vec<&str> = init_data.split('&')
+        .filter(|p| !p.starts_with("hash="))
+        .collect();
+    parts.sort();
+    let data_check_string = parts.join("
+");
+
+    // HMAC-SHA256(data_check_string, HMAC-SHA256("WebAppData", bot_token))
+    let mut mac1 = HmacSha256::new_from_slice(b"WebAppData").unwrap();
+    mac1.update(bot_token.as_bytes());
+    let secret_key = mac1.finalize().into_bytes();
+
+    let mut mac2 = HmacSha256::new_from_slice(&secret_key).unwrap();
+    mac2.update(data_check_string.as_bytes());
+    let expected = hex::encode(mac2.finalize().into_bytes());
+
+    expected == hash
+}
+
+// parse_tg_user_from_init_data — извлекает username и имя из initData
+fn parse_tg_user_from_init_data(init_data: &str) -> (String, String) {
+    let user_str = init_data.split('&').find_map(|part| {
+        part.strip_prefix("user=").map(|v| v.to_string())
+    }).unwrap_or_default();
+    if user_str.is_empty() { return (String::new(), String::new()); }
+    let decoded = urlencoding::decode(&user_str).unwrap_or_default();
+    let val = serde_json::from_str::<serde_json::Value>(&decoded).unwrap_or_default();
+    let username = val["username"].as_str().unwrap_or("").to_string();
+    let first = val["first_name"].as_str().unwrap_or("").to_string();
+    let last = val["last_name"].as_str().unwrap_or("").to_string();
+    let full_name = if last.is_empty() { first } else { format!("{} {}", first, last) };
+    (username, full_name)
+}
+
+// parse_tg_id_from_init_data — извлекает tg_id из поля user в initData
+fn parse_tg_id_from_init_data(init_data: &str) -> i64 {
+    let user_str = init_data.split('&').find_map(|part| {
+        part.strip_prefix("user=").map(|v| v.to_string())
+    }).unwrap_or_default();
+    if user_str.is_empty() { return 0; }
+    // URL decode
+    let decoded = urlencoding::decode(&user_str).unwrap_or_default();
+    serde_json::from_str::<serde_json::Value>(&decoded)
+        .ok()
+        .and_then(|v| v["id"].as_i64())
+        .unwrap_or(0)
+}
+
+
 
 // hdr — читает заголовок HTTP запроса по имени (возвращает пустую строку если нет)
 fn hdr(h: &Headers, k: &str) -> String {
@@ -298,20 +358,6 @@ fn is_bot(ua: &str) -> bool {
     bot_keywords.iter().any(|kw| u.contains(kw))
 }
 
-// html_escape — экранирует спецсимволы HTML (защита от XSS)
-fn html_escape(s: &str) -> String {
-    s.chars().fold(String::with_capacity(s.len()), |mut out, c| {
-        match c {
-            '<'  => out.push_str("&lt;"),
-            '>'  => out.push_str("&gt;"),
-            '&'  => out.push_str("&amp;"),
-            '"'  => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _    => out.push(c),
-        }
-        out
-    })
-}
 
 // source_from_ref — определяет источник трафика по Referer заголовку
 // Используется как запасной вариант если нет utm параметров
@@ -557,7 +603,7 @@ const LOGIN_PAGE: &str = r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><me
 
 // DASH — главная страница дашборда (вкладки: Activity, Countries, Devices, Sources, Purchases, Telegram)
 // Обновляется каждые 5 секунд через /api/stats, кнопка Sale отправляет на /api/purchase
-const DASH: &str = r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0a0f1a;color:#e2e8f0;padding:20px}.wrap{max-width:1400px;margin:0 auto}.hdr{display:flex;align-items:center;gap:12px;margin-bottom:20px}h1{font-size:22px}.live{display:flex;align-items:center;gap:6px;font-size:12px;color:#64748b}.dot{width:8px;height:8px;border-radius:50%;background:#10b981;animation:pulse 2s infinite}.dot.err{background:#ef4444;animation:none}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}.stat{background:#1a2332;border-radius:12px;padding:20px;text-align:center}.stat-v{font-size:32px;font-weight:700;color:#3b82f6}.stat-l{font-size:12px;color:#64748b;margin-top:4px}.stat.grn .stat-v{color:#10b981}.stat.prp .stat-v{color:#a855f7}.stat.yel .stat-v{color:#f59e0b}.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.tab{background:#1a2332;border:none;color:#94a3b8;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:13px}.tab.on{background:#3b82f6;color:#fff}.panel{display:none}.panel.on{display:block}.card{background:#1a2332;border-radius:12px;padding:20px;margin-bottom:16px}.card-t{font-size:14px;font-weight:600;margin-bottom:16px}.bar{margin-bottom:12px}.bar-h{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}.bar-t{height:8px;background:#0a0f1a;border-radius:4px}.bar-f{height:100%;border-radius:4px;transition:width .5s}.tbl{background:#1a2332;border-radius:12px;overflow:hidden}.tbl-h{padding:16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a3444}.tbl-s{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:12px;text-align:left;font-size:13px}th{background:#0f1520;color:#64748b;font-size:11px;text-transform:uppercase;position:sticky;top:0}tr:hover{background:#0f1520}tr.new{animation:flash .8s ease-out}.btn{background:#3b82f6;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px}.btn.grn{background:#10b981}.btn.sm{padding:4px 10px;font-size:11px}.btn.cancel{background:#2a3444}.btn.ghost{background:#1a2332;color:#94a3b8;border:1px solid #2a3444}.btn:disabled{opacity:.4;cursor:default}.empty{color:#64748b;text-align:center;padding:40px}.pag{display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid #2a3444}.pag-info{font-size:12px;color:#64748b;flex:1}@keyframes flash{0%{background:#1e3a5f}100%{background:transparent}}.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;align-items:center;justify-content:center}.overlay.show{display:flex}.modal{background:#1a2332;border-radius:16px;padding:28px;width:380px;max-width:90vw}.modal h2{font-size:16px;margin-bottom:20px}.modal label{font-size:12px;color:#94a3b8;display:block;margin-bottom:6px}.modal input,.modal select{width:100%;background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:14px;outline:none}.modal-btns{display:flex;gap:12px;margin-top:8px}.modal-btns .btn{flex:1;padding:10px}.fbc-hint{font-size:11px;color:#64748b;margin-bottom:14px;word-break:break-all}@media(max-width:768px){.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.stats{grid-template-columns:1fr}}</style></head><body><div class="wrap"><div class="hdr"><h1>Analytics Dashboard</h1><div class="live"><div class="dot" id="dot"></div><span id="upd">connecting...</span></div></div><div class="stats"><div class="stat"><div class="stat-v" id="tot">-</div><div class="stat-l">TOTAL VISITS</div></div><div class="stat grn"><div class="stat-v" id="s_pur">-</div><div class="stat-l">PURCHASES</div></div><div class="stat prp"><div class="stat-v" id="s_rev">-</div><div class="stat-l">REVENUE</div></div><div class="stat yel"><div class="stat-v" id="s_cr">-</div><div class="stat-l">CONV RATE</div></div></div><div class="tabs"><button class="tab on" data-p="0">Activity</button><button class="tab" data-p="1">Countries</button><button class="tab" data-p="2">Devices</button><button class="tab" data-p="3">Sources</button><button class="tab" data-p="4">💰 Purchases</button><button class="tab" data-p="5">👤 Leads</button><button class="tab" data-p="6">💬 Telegram</button></div><div id="p0" class="panel on"><div class="tbl"><div class="tbl-h"><span>Recent Activity</span><div style="display:flex;gap:8px"><button class="btn" onclick="fetchData()">Refresh</button><button class="btn" style="background:#ef4444" onclick="delAll(\'visits\')">🗑 Delete All</button></div></div><div style="padding:12px 16px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #2a3444"><input id="srch" type="text" placeholder="Search TG user, name, ID, source, country..." style="flex:1;min-width:200px;background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" oninput="vPage=0;renderVisitPage()"><select id="f_src" style="background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" onchange="vPage=0;renderVisitPage()"><option value="">All Sources</option></select><select id="f_co" style="background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" onchange="vPage=0;renderVisitPage()"><option value="">All Countries</option></select><button class="btn ghost" onclick="document.getElementById(\'srch\').value=\'\';document.getElementById(\'f_src\').value=\'\';document.getElementById(\'f_co\').value=\'\';vPage=0;renderVisitPage()">✕ Reset</button></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>Location</th><th>Device</th><th>Source</th><th>Campaign</th><th>fbclid</th><th>Telegram</th><th></th></tr></thead><tbody id="rows"></tbody></table></div><div class="pag"><span class="pag-info" id="pag_info"></span><button class="btn ghost" id="pag_prev" onclick="pg(vPage-1)">← Prev</button><button class="btn ghost" id="pag_next" onclick="pg(vPage+1)">Next →</button></div></div></div><div id="p1" class="panel"><div class="card"><div class="card-t">Top Countries</div><div id="c_co"></div></div></div><div id="p2" class="panel"><div class="card"><div class="card-t">Devices</div><div id="c_dv"></div></div></div><div id="p3" class="panel"><div class="card"><div class="card-t">Traffic Sources</div><div id="c_sr"></div></div></div><div id="p4" class="panel"><div class="tbl"><div class="tbl-h"><span>Purchase History</span><button class="btn" style="background:#ef4444" onclick="delAll(\'purchases\')">🗑 Delete All</button></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>Amount</th><th>Currency</th><th>CAPI</th><th>Campaign</th><th>fbclid</th><th></th></tr></thead><tbody id="prows"></tbody></table></div><div class="pag"><span class="pag-info" id="ppag_info"></span><button class="btn ghost" id="ppag_prev" onclick="ppg(pPage-1)">← Prev</button><button class="btn ghost" id="ppag_next" onclick="ppg(pPage+1)">Next →</button></div></div></div><div id="p5" class="panel"><div class="tbl"><div class="tbl-h"><span>Leads</span><button class="btn" style="background:#ef4444" onclick="delAll(\'registrations\')">🗑 Delete All</button></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>CAPI</th><th>Campaign</th><th>fbclid</th></tr></thead><tbody id="regrows"></tbody></table></div><div class="pag"><span class="pag-info" id="rpag_info"></span><button class="btn ghost" id="rpag_prev" onclick="rpg(rPage-1)">← Prev</button><button class="btn ghost" id="rpag_next" onclick="rpg(rPage+1)">Next →</button></div></div></div><div id="p6" class="panel"><div class="tbl"><div class="tbl-h"><span>Telegram Users</span><button class="btn" style="background:#ef4444" onclick="delAll(\'tg_links\')">🗑 Delete All</button></div><div style="padding:12px 16px;border-bottom:1px solid #2a3444"><input id="tg_srch" type="text" placeholder="Search username, name, Telegram ID..." style="width:100%;background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" oninput="renderTgTable()"></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>Username / Name</th><th>Telegram ID</th><th>Visit ID</th><th></th></tr></thead><tbody id="tgrows"></tbody></table></div></div></div></div><div class="overlay" id="overlay"><div class="modal"><h2>💰 Register Sale</h2><label>Amount</label><input type="number" id="m_amount" placeholder="0.00" step="0.01" min="0"><label>Currency</label><select id="m_cur"><option value="USD">USD</option><option value="EUR">EUR</option><option value="GBP">GBP</option><option value="RUB">RUB</option><option value="UAH">UAH</option></select><div class="fbc-hint" id="m_fbc"></div><div class="modal-btns"><button class="btn cancel" onclick="closeModal()">Cancel</button><button class="btn grn" id="m_btn" onclick="submitSale()">Confirm Sale</button></div></div></div><script>var K='__APIKEY__';var F={US:'🇺🇸',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',RU:'🇷🇺',UA:'🇺🇦',PL:'🇵🇱',IT:'🇮🇹',ES:'🇪🇸',BR:'🇧🇷',CA:'🇨🇦',AU:'🇦🇺',JP:'🇯🇵',KR:'🇰🇷',CN:'🇨🇳',IN:'🇮🇳',TR:'🇹🇷',VN:'🇻🇳',TH:'🇹🇭',CO:'🇨🇴',MX:'🇲🇽',AR:'🇦🇷',PH:'🇵🇭',ID:'🇮🇩',MY:'🇲🇾',SG:'🇸🇬',SA:'🇸🇦',AE:'🇦🇪',EG:'🇪🇬',ZA:'🇿🇦'};var PAGE=10;var prevTotal=0;var visitMap={};var saleData={};var allVisits=[];var allPurchases=[];var vPage=0;var pPage=0;var rPage=0;var allRegs=[];var allTgLinks=[];document.querySelectorAll('.tab').forEach(function(t){t.onclick=function(){document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on')});document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on')});t.classList.add('on');document.getElementById('p'+t.dataset.p).classList.add('on')}});function bar(data,color){var arr=Object.entries(data||{}).sort(function(a,b){return b[1]-a[1]}).slice(0,10);if(!arr.length)return'<div class="empty">No data</div>';var max=arr[0][1];return arr.map(function(x){return'<div class="bar"><div class="bar-h"><span>'+x[0]+'</span><span>'+x[1]+'</span></div><div class="bar-t"><div class="bar-f" style="width:'+Math.round(x[1]/max*100)+'%;background:'+color+'"></div></div></div>'}).join('')}function time(t){try{var d=new Date(typeof t==='number'?t:parseInt(t));return d.toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZone:'America/Los_Angeles'})+' PT'}catch(e){return'-'}}function openSale(vid){var v=visitMap[vid];if(!v)return;saleData={fbclid:v.fbclid,visit_t:v.t,ua:v.ua,utm_c:v.utm_c||''};document.getElementById('m_fbc').textContent=v.fbclid?'fbclid: '+(v.fbclid.length>50?v.fbclid.slice(0,50)+'...':v.fbclid):'⚠️ No fbclid (organic — CAPI will not fire)';document.getElementById('m_amount').value='';document.getElementById('overlay').classList.add('show')}function closeModal(){document.getElementById('overlay').classList.remove('show')}async function submitSale(){var amount=parseFloat(document.getElementById('m_amount').value);var currency=document.getElementById('m_cur').value;if(!amount||amount<=0){alert('Enter valid amount');return}var btn=document.getElementById('m_btn');btn.textContent='Sending...';btn.disabled=true;try{var r=await fetch('/api/purchase',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,fbclid:saleData.fbclid,amount:amount,currency:currency,visit_t:saleData.visit_t,ua:saleData.ua,utm_c:saleData.utm_c})});var d=await r.json();closeModal();if(d.capi_ok){alert('✅ Sale registered! CAPI sent (ID: '+d.event_id+')')}else{alert('✅ Sale saved. CAPI failed — check FB_PIXEL_ID / FB_ACCESS_TOKEN.')}fetchData()}catch(e){alert('Error: '+e.message)}finally{btn.textContent='Confirm Sale';btn.disabled=false}}async function sendLead(vid){var v=visitMap[vid];if(!v)return;try{var r=await fetch('/api/registration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,fbclid:v.fbclid,visit_t:v.t,ua:v.ua,utm_c:v.utm_c||''})});var d=await r.json();if(d.capi_ok){alert('✅ Lead sent! (ID: '+d.event_id+')')}else{alert('❌ CAPI failed — check FB_PIXEL_ID / FB_ACCESS_TOKEN.')}}catch(e){alert('Error: '+e.message)}}function filteredVisits(){var q=(document.getElementById('srch')||{value:''}).value.toLowerCase();var fs=(document.getElementById('f_src')||{value:''}).value;var fc=(document.getElementById('f_co')||{value:''}).value;return allVisits.filter(function(v){var tg=window._tgMap&&window._tgMap[v.vid];var tgStr=tg?((tg.tg_user||'')+(tg.tg_name||'')+(tg.tg_id||'')).toLowerCase():'';if(q&&!(v.co+v.ci+v.s+v.utm_c+v.fbclid+tgStr).toLowerCase().includes(q))return false;if(fs&&(v.s||'Direct')!==fs)return false;if(fc&&v.co!==fc)return false;return true})}function pg(n){var total=filteredVisits().length;var maxP=Math.max(0,Math.ceil(total/PAGE)-1);vPage=Math.max(0,Math.min(n,maxP));renderVisitPage()}function ppg(n){var total=allPurchases.length;var maxP=Math.max(0,Math.ceil(total/PAGE)-1);pPage=Math.max(0,Math.min(n,maxP));renderPurchasePage()}function rpg(n){var total=allRegs.length;var maxP=Math.max(0,Math.ceil(total/PAGE)-1);rPage=Math.max(0,Math.min(n,maxP));renderRegPage()}function renderRegPage(){var total=allRegs.length;var start=rPage*PAGE;var slice=allRegs.slice(start,start+PAGE);document.getElementById('rpag_info').textContent='Showing '+(total?start+1:0)+'-'+Math.min(start+PAGE,total)+' of '+total;document.getElementById('rpag_prev').disabled=rPage===0;document.getElementById('rpag_next').disabled=start+PAGE>=total;var html=slice.map(function(r){var capiStatus=r.capi_ok?'<span style="color:#10b981">✅ Sent</span>':'<span style="color:#ef4444">❌ Failed</span>';var fbc=r.fbclid?r.fbclid.slice(0,16)+'...':'—';return'<tr><td>'+time(r.t)+'</td><td>'+capiStatus+'</td><td>'+(r.utm_c||'—')+'</td><td>'+fbc+'</td></tr>'}).join('');document.getElementById('regrows').innerHTML=html||'<tr><td colspan="4" class="empty">No leads yet</td></tr>'}function renderVisitPage(){var fv=filteredVisits();var total=fv.length;var start=vPage*PAGE;var slice=fv.slice(start,start+PAGE);document.getElementById('pag_info').textContent='Showing '+(total?start+1:0)+'-'+Math.min(start+PAGE,total)+' of '+total+(total!==allVisits.length?' (filtered from '+allVisits.length+')':'');document.getElementById('pag_prev').disabled=vPage===0;document.getElementById('pag_next').disabled=start+PAGE>=total;var html=slice.map(function(v,i){var flag=F[v.co]||'🌍';var city=v.ci&&v.ci!=='??'?' • '+v.ci:'';var isNew=i===0&&vPage===0&&allVisits.length>prevTotal?'new':'';var fbc=v.fbclid?'<span style="color:#10b981">✅</span>':'—';var camp=v.utm_c?'<span style="color:#f59e0b;font-size:11px">'+v.utm_c+(v.utm_as?'<br><span style="color:#94a3b8">'+v.utm_as+'</span>':'')+'</span>':'—';var tg=v.vid&&window._tgMap&&window._tgMap[v.vid];var tgCell=tg?(tg.tg_user?'<a href="https://t.me/'+tg.tg_user+'" target="_blank" style="color:#3b82f6">@'+tg.tg_user+'</a>':'<span style="color:#f59e0b">'+(tg.tg_name||'—')+'</span> <span style="color:#64748b;font-size:11px">ID:'+tg.tg_id+'</span>'):'—';var isFb=v.fbclid||(v.s==='Facebook'||v.s==='Facebook Ads');var btns=isFb&&v.vid?'<button class="btn grn sm" onclick="openSale(\''+v.vid+'\')">💰 Sale</button> <button class="btn sm" style="background:#8b5cf6" onclick="sendLead(\''+v.vid+'\')">👤 Lead</button> ':'';btns+='<button class="btn sm" style="background:#ef4444" onclick="delRow(\'visits\','+v.id+')">✕</button>';return'<tr class="'+isNew+'"><td>'+time(v.t)+'</td><td>'+flag+' '+v.co+city+'</td><td>'+v.d+'</td><td>'+(v.s||'Direct')+'</td><td>'+camp+'</td><td>'+fbc+'</td><td>'+tgCell+'</td><td style="white-space:nowrap">'+btns+'</td></tr>'}).join('');document.getElementById('rows').innerHTML=html||'<tr><td colspan="8" class="empty">No visits yet</td></tr>'}function renderPurchasePage(){var total=allPurchases.length;var start=pPage*PAGE;var slice=allPurchases.slice(start,start+PAGE);document.getElementById('ppag_info').textContent='Showing '+(total?start+1:0)+'-'+Math.min(start+PAGE,total)+' of '+total;document.getElementById('ppag_prev').disabled=pPage===0;document.getElementById('ppag_next').disabled=start+PAGE>=total;var phtml=slice.map(function(p){var capiStatus=p.capi_ok?'<span style="color:#10b981">✅ Sent</span>':'<span style="color:#ef4444">❌ Failed</span>';var fbc=p.fbclid?p.fbclid.slice(0,16)+'...':'—';return'<tr><td>'+time(p.t)+'</td><td><b>'+p.amount.toFixed(2)+'</b></td><td>'+p.currency+'</td><td>'+capiStatus+'</td><td>'+(p.utm_c||'—')+'</td><td>'+fbc+'</td><td><button class="btn sm" style="background:#ef4444" onclick="delRow(\'purchases\','+p.id+')">✕</button></td></tr>'}).join('');document.getElementById('prows').innerHTML=phtml||'<tr><td colspan="7" class="empty">No purchases yet</td></tr>'}function render(D){var s=D.stats;var newTotal=s.total;document.getElementById('tot').textContent=newTotal;document.getElementById('s_pur').textContent=s.purchases||0;document.getElementById('s_rev').textContent=(s.revenue||0).toFixed(2);var cr=newTotal>0?((s.purchases||0)/newTotal*100).toFixed(1)+'%':'0.0%';document.getElementById('s_cr').textContent=cr;var co={};Object.entries(s.countries||{}).forEach(function(x){co[(F[x[0]]||'🌍')+' '+x[0]]=x[1]});document.getElementById('c_co').innerHTML=bar(co,'#3b82f6');document.getElementById('c_dv').innerHTML=bar(s.devices,'#10b981');document.getElementById('c_sr').innerHTML=bar(s.sources,'#a855f7');visitMap={};(D.visits||[]).forEach(function(v){if(v.vid&&(v.fbclid||v.s==='Facebook'||v.s==='Facebook Ads'))visitMap[v.vid]=v});window._tgMap={};(D.tg_links||[]).forEach(function(l){if(l.vid)window._tgMap[l.vid]=l});allVisits=D.visits||[];allPurchases=D.purchases||[];allRegs=D.registrations||[];if(newTotal>prevTotal)vPage=0;updateFilters();renderVisitPage();renderPurchasePage();renderRegPage();allTgLinks=D.tg_links||[];renderTgTable();prevTotal=newTotal}async function fetchData(){var dot=document.getElementById('dot');var upd=document.getElementById('upd');try{var r=await fetch('/api/stats?key='+K);if(!r.ok)throw new Error(r.status);var d=await r.json();render(d);dot.classList.remove('err');upd.textContent='updated '+new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch(e){dot.classList.add('err');upd.textContent='error - retrying...';console.error(e)}}function renderTgTable(){var q=(document.getElementById('tg_srch')||{value:''}).value.toLowerCase();var list=allTgLinks.filter(function(l){if(!q)return true;return(l.tg_user||'').toLowerCase().includes(q)||(l.tg_name||'').toLowerCase().includes(q)||(l.tg_id||'').toString().includes(q)});var html=list.slice(0,500).map(function(l){var user=l.tg_user?'<a href="https://t.me/'+l.tg_user+'" target="_blank" style="color:#3b82f6">@'+l.tg_user+'</a>':'<span style="color:#f59e0b">'+(l.tg_name||'—')+'</span>';return'<tr><td>'+time(l.t)+'</td><td>'+user+(l.tg_name&&l.tg_user?' <span style="color:#64748b;font-size:11px">'+l.tg_name+'</span>':'')+'</td><td style="color:#94a3b8">'+l.tg_id+'</td><td style="color:#64748b">'+l.vid+'</td><td><button class="btn sm" style="background:#ef4444" onclick="delRow(\'tg_links\','+l.id+')">✕</button></td></tr>'}).join('');document.getElementById('tgrows').innerHTML=html||'<tr><td colspan="5" class="empty">No Telegram users yet</td></tr>'}async function delRow(table,id){try{await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,table:table,id:id})});fetchData()}catch(e){}}async function delAll(table){try{await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,table:table,all:true})});fetchData()}catch(e){}}function updateFilters(){var srcs=new Set();var cos=new Set();allVisits.forEach(function(v){srcs.add(v.s||'Direct');cos.add(v.co)});var se=document.getElementById('f_src');if(se){var cv=se.value;se.innerHTML='<option value="">All Sources</option>';Array.from(srcs).sort().forEach(function(s){se.innerHTML+='<option value="'+s+'"'+(cv===s?' selected':'')+'>'+s+'</option>'})}var ce=document.getElementById('f_co');if(ce){var ccv=ce.value;ce.innerHTML='<option value="">All Countries</option>';Array.from(cos).sort().forEach(function(c){ce.innerHTML+='<option value="'+c+'"'+(ccv===c?' selected':'')+'>'+c+'</option>'})}}fetchData();setInterval(fetchData,5000)</script></body></html>"#;
+const DASH: &str = r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#0a0f1a;color:#e2e8f0;padding:20px}.wrap{max-width:1400px;margin:0 auto}.hdr{display:flex;align-items:center;gap:12px;margin-bottom:20px}h1{font-size:22px}.live{display:flex;align-items:center;gap:6px;font-size:12px;color:#64748b}.dot{width:8px;height:8px;border-radius:50%;background:#10b981;animation:pulse 2s infinite}.dot.err{background:#ef4444;animation:none}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}.stat{background:#1a2332;border-radius:12px;padding:20px;text-align:center}.stat-v{font-size:32px;font-weight:700;color:#3b82f6}.stat-l{font-size:12px;color:#64748b;margin-top:4px}.stat.grn .stat-v{color:#10b981}.stat.prp .stat-v{color:#a855f7}.stat.yel .stat-v{color:#f59e0b}.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}.tab{background:#1a2332;border:none;color:#94a3b8;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:13px}.tab.on{background:#3b82f6;color:#fff}.panel{display:none}.panel.on{display:block}.card{background:#1a2332;border-radius:12px;padding:20px;margin-bottom:16px}.card-t{font-size:14px;font-weight:600;margin-bottom:16px}.bar{margin-bottom:12px}.bar-h{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}.bar-t{height:8px;background:#0a0f1a;border-radius:4px}.bar-f{height:100%;border-radius:4px;transition:width .5s}.tbl{background:#1a2332;border-radius:12px;overflow:hidden}.tbl-h{padding:16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a3444}.tbl-s{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:12px;text-align:left;font-size:13px}th{background:#0f1520;color:#64748b;font-size:11px;text-transform:uppercase;position:sticky;top:0}tr:hover{background:#0f1520}tr.new{animation:flash .8s ease-out}.btn{background:#3b82f6;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px}.btn.grn{background:#10b981}.btn.sm{padding:4px 10px;font-size:11px}.btn.cancel{background:#2a3444}.btn.ghost{background:#1a2332;color:#94a3b8;border:1px solid #2a3444}.btn:disabled{opacity:.4;cursor:default}.empty{color:#64748b;text-align:center;padding:40px}.pag{display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid #2a3444}.pag-info{font-size:12px;color:#64748b;flex:1}@keyframes flash{0%{background:#1e3a5f}100%{background:transparent}}.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;align-items:center;justify-content:center}.overlay.show{display:flex}.modal{background:#1a2332;border-radius:16px;padding:28px;width:380px;max-width:90vw}.modal h2{font-size:16px;margin-bottom:20px}.modal label{font-size:12px;color:#94a3b8;display:block;margin-bottom:6px}.modal input,.modal select{width:100%;background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:14px;outline:none}.modal-btns{display:flex;gap:12px;margin-top:8px}.modal-btns .btn{flex:1;padding:10px}.fbc-hint{font-size:11px;color:#64748b;margin-bottom:14px;word-break:break-all}@media(max-width:768px){.stats{grid-template-columns:repeat(2,1fr)}}@media(max-width:480px){.stats{grid-template-columns:1fr}}</style></head><body><div class="wrap"><div class="hdr"><h1>Analytics Dashboard</h1><div class="live"><div class="dot" id="dot"></div><span id="upd">connecting...</span></div></div><div class="stats"><div class="stat"><div class="stat-v" id="tot">-</div><div class="stat-l">TOTAL VISITS</div></div><div class="stat grn"><div class="stat-v" id="s_pur">-</div><div class="stat-l">PURCHASES</div></div><div class="stat prp"><div class="stat-v" id="s_rev">-</div><div class="stat-l">REVENUE</div></div><div class="stat yel"><div class="stat-v" id="s_cr">-</div><div class="stat-l">CONV RATE</div></div></div><div class="tabs"><button class="tab on" data-p="0">Activity</button><button class="tab" data-p="1">Countries</button><button class="tab" data-p="2">Devices</button><button class="tab" data-p="3">Sources</button><button class="tab" data-p="4">💰 Purchases</button><button class="tab" data-p="5">👤 Leads</button><button class="tab" data-p="6">💬 Telegram</button></div><div id="p0" class="panel on"><div class="tbl"><div class="tbl-h"><span>Recent Activity</span><div style="display:flex;gap:8px"><button class="btn" onclick="fetchData()">Refresh</button><button class="btn" style="background:#ef4444" onclick="delAll(\'visits\')">🗑 Delete All</button></div></div><div style="padding:12px 16px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #2a3444"><input id="srch" type="text" placeholder="Search TG user, name, ID, source, country..." style="flex:1;min-width:200px;background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" oninput="vPage=0;renderVisitPage()"><select id="f_src" style="background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" onchange="vPage=0;renderVisitPage()"><option value="">All Sources</option></select><select id="f_co" style="background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" onchange="vPage=0;renderVisitPage()"><option value="">All Countries</option></select><button class="btn ghost" onclick="document.getElementById(\'srch\').value=\'\';document.getElementById(\'f_src\').value=\'\';document.getElementById(\'f_co\').value=\'\';vPage=0;renderVisitPage()">✕ Reset</button></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>Location</th><th>Device</th><th>Source</th><th>Campaign</th><th>fbclid</th><th>Telegram</th><th></th></tr></thead><tbody id="rows"></tbody></table></div><div class="pag"><span class="pag-info" id="pag_info"></span><button class="btn ghost" id="pag_prev" onclick="pg(vPage-1)">← Prev</button><button class="btn ghost" id="pag_next" onclick="pg(vPage+1)">Next →</button></div></div></div><div id="p1" class="panel"><div class="card"><div class="card-t">Top Countries</div><div id="c_co"></div></div></div><div id="p2" class="panel"><div class="card"><div class="card-t">Devices</div><div id="c_dv"></div></div></div><div id="p3" class="panel"><div class="card"><div class="card-t">Traffic Sources</div><div id="c_sr"></div></div></div><div id="p4" class="panel"><div class="tbl"><div class="tbl-h"><span>Purchase History</span><button class="btn" style="background:#ef4444" onclick="delAll(\'purchases\')">🗑 Delete All</button></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>Amount</th><th>Currency</th><th>CAPI</th><th>Campaign</th><th>fbclid</th><th></th></tr></thead><tbody id="prows"></tbody></table></div><div class="pag"><span class="pag-info" id="ppag_info"></span><button class="btn ghost" id="ppag_prev" onclick="ppg(pPage-1)">← Prev</button><button class="btn ghost" id="ppag_next" onclick="ppg(pPage+1)">Next →</button></div></div></div><div id="p5" class="panel"><div class="tbl"><div class="tbl-h"><span>Leads</span><button class="btn" style="background:#ef4444" onclick="delAll(\'registrations\')">🗑 Delete All</button></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>CAPI</th><th>Campaign</th><th>fbclid</th></tr></thead><tbody id="regrows"></tbody></table></div><div class="pag"><span class="pag-info" id="rpag_info"></span><button class="btn ghost" id="rpag_prev" onclick="rpg(rPage-1)">← Prev</button><button class="btn ghost" id="rpag_next" onclick="rpg(rPage+1)">Next →</button></div></div></div><div id="p6" class="panel"><div class="tbl"><div class="tbl-h"><span>Telegram Users</span><button class="btn" style="background:#ef4444" onclick="delAll(\'tg_links\')">🗑 Delete All</button></div><div style="padding:12px 16px;border-bottom:1px solid #2a3444"><input id="tg_srch" type="text" placeholder="Search username, name, Telegram ID..." style="width:100%;background:#0a0f1a;border:1px solid #2a3444;color:#e2e8f0;padding:8px 12px;border-radius:8px;font-size:13px;outline:none" oninput="renderTgTable()"></div><div class="tbl-s"><table><thead><tr><th>Time</th><th>Username / Name</th><th>Telegram ID</th><th>Visit ID</th><th></th></tr></thead><tbody id="tgrows"></tbody></table></div></div></div></div><div class="overlay" id="overlay"><div class="modal"><h2>💰 Register Sale</h2><label>Amount</label><input type="number" id="m_amount" placeholder="0.00" step="0.01" min="0"><label>Currency</label><select id="m_cur"><option value="USD">USD</option><option value="EUR">EUR</option><option value="GBP">GBP</option><option value="RUB">RUB</option><option value="UAH">UAH</option></select><div class="fbc-hint" id="m_fbc"></div><div class="modal-btns"><button class="btn cancel" onclick="closeModal()">Cancel</button><button class="btn grn" id="m_btn" onclick="submitSale()">Confirm Sale</button></div></div></div><script>var K='__APIKEY__';var F={US:'🇺🇸',GB:'🇬🇧',DE:'🇩🇪',FR:'🇫🇷',NL:'🇳🇱',RU:'🇷🇺',UA:'🇺🇦',PL:'🇵🇱',IT:'🇮🇹',ES:'🇪🇸',BR:'🇧🇷',CA:'🇨🇦',AU:'🇦🇺',JP:'🇯🇵',KR:'🇰🇷',CN:'🇨🇳',IN:'🇮🇳',TR:'🇹🇷',VN:'🇻🇳',TH:'🇹🇭',CO:'🇨🇴',MX:'🇲🇽',AR:'🇦🇷',PH:'🇵🇭',ID:'🇮🇩',MY:'🇲🇾',SG:'🇸🇬',SA:'🇸🇦',AE:'🇦🇪',EG:'🇪🇬',ZA:'🇿🇦'};var PAGE=10;var prevTotal=0;var visitMap={};var saleData={};var allVisits=[];var allPurchases=[];var vPage=0;var pPage=0;var rPage=0;var allRegs=[];var allTgLinks=[];document.querySelectorAll('.tab').forEach(function(t){t.onclick=function(){document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('on')});document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on')});t.classList.add('on');document.getElementById('p'+t.dataset.p).classList.add('on')}});function bar(data,color){var arr=Object.entries(data||{}).sort(function(a,b){return b[1]-a[1]}).slice(0,10);if(!arr.length)return'<div class="empty">No data</div>';var max=arr[0][1];return arr.map(function(x){return'<div class="bar"><div class="bar-h"><span>'+x[0]+'</span><span>'+x[1]+'</span></div><div class="bar-t"><div class="bar-f" style="width:'+Math.round(x[1]/max*100)+'%;background:'+color+'"></div></div></div>'}).join('')}function time(t){try{var d=new Date(typeof t==='number'?t:parseInt(t));return d.toLocaleString('en-GB',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZone:'America/Los_Angeles'})+' PT'}catch(e){return'-'}}function openSale(vid){var v=visitMap[vid];if(!v)return;saleData={fbclid:v.fbclid,visit_t:v.t,ua:v.ua,utm_c:v.utm_c||''};document.getElementById('m_fbc').textContent=v.fbclid?'fbclid: '+(v.fbclid.length>50?v.fbclid.slice(0,50)+'...':v.fbclid):'⚠️ No fbclid (organic — CAPI will not fire)';document.getElementById('m_amount').value='';document.getElementById('overlay').classList.add('show')}function closeModal(){document.getElementById('overlay').classList.remove('show')}async function submitSale(){var amount=parseFloat(document.getElementById('m_amount').value);var currency=document.getElementById('m_cur').value;if(!amount||amount<=0){alert('Enter valid amount');return}var btn=document.getElementById('m_btn');btn.textContent='Sending...';btn.disabled=true;try{var r=await fetch('/api/purchase',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,fbclid:saleData.fbclid,amount:amount,currency:currency,visit_t:saleData.visit_t,ua:saleData.ua,utm_c:saleData.utm_c})});var d=await r.json();closeModal();if(d.capi_ok){alert('✅ Sale registered! CAPI sent (ID: '+d.event_id+')')}else{alert('✅ Sale saved. CAPI failed — check FB_PIXEL_ID / FB_ACCESS_TOKEN.')}fetchData()}catch(e){alert('Error: '+e.message)}finally{btn.textContent='Confirm Sale';btn.disabled=false}}async function sendLead(vid){var v=visitMap[vid];if(!v)return;try{var r=await fetch('/api/registration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,fbclid:v.fbclid,visit_t:v.t,ua:v.ua,utm_c:v.utm_c||''})});var d=await r.json();if(d.capi_ok){alert('✅ Lead sent! (ID: '+d.event_id+')')}else{alert('❌ CAPI failed — check FB_PIXEL_ID / FB_ACCESS_TOKEN.')}}catch(e){alert('Error: '+e.message)}}function filteredVisits(){var q=(document.getElementById('srch')||{value:''}).value.toLowerCase();var fs=(document.getElementById('f_src')||{value:''}).value;var fc=(document.getElementById('f_co')||{value:''}).value;return allVisits.filter(function(v){var tg=window._tgMap&&window._tgMap[v.vid];var tgStr=tg?((tg.tg_user||'')+(tg.tg_name||'')+(tg.tg_id||'')).toLowerCase():'';if(q&&!(v.co+v.ci+v.s+v.utm_c+v.fbclid+tgStr).toLowerCase().includes(q))return false;if(fs&&(v.s||'Direct')!==fs)return false;if(fc&&v.co!==fc)return false;return true})}function pg(n){var total=filteredVisits().length;var maxP=Math.max(0,Math.ceil(total/PAGE)-1);vPage=Math.max(0,Math.min(n,maxP));renderVisitPage()}function ppg(n){var total=allPurchases.length;var maxP=Math.max(0,Math.ceil(total/PAGE)-1);pPage=Math.max(0,Math.min(n,maxP));renderPurchasePage()}function rpg(n){var total=allRegs.length;var maxP=Math.max(0,Math.ceil(total/PAGE)-1);rPage=Math.max(0,Math.min(n,maxP));renderRegPage()}function renderRegPage(){var total=allRegs.length;var start=rPage*PAGE;var slice=allRegs.slice(start,start+PAGE);document.getElementById('rpag_info').textContent='Showing '+(total?start+1:0)+'-'+Math.min(start+PAGE,total)+' of '+total;document.getElementById('rpag_prev').disabled=rPage===0;document.getElementById('rpag_next').disabled=start+PAGE>=total;var html=slice.map(function(r){var capiStatus=r.capi_ok?'<span style="color:#10b981">✅ Sent</span>':'<span style="color:#ef4444">❌ Failed</span>';var fbc=r.fbclid?r.fbclid.slice(0,16)+'...':'—';return'<tr><td>'+time(r.t)+'</td><td>'+capiStatus+'</td><td>'+(r.utm_c||'—')+'</td><td>'+fbc+'</td></tr>'}).join('');document.getElementById('regrows').innerHTML=html||'<tr><td colspan="4" class="empty">No leads yet</td></tr>'}function renderVisitPage(){var fv=filteredVisits();var total=fv.length;var start=vPage*PAGE;var slice=fv.slice(start,start+PAGE);document.getElementById('pag_info').textContent='Showing '+(total?start+1:0)+'-'+Math.min(start+PAGE,total)+' of '+total+(total!==allVisits.length?' (filtered from '+allVisits.length+')':'');document.getElementById('pag_prev').disabled=vPage===0;document.getElementById('pag_next').disabled=start+PAGE>=total;var html=slice.map(function(v,i){var flag=F[v.co]||'🌍';var city=v.ci&&v.ci!=='??'?' • '+v.ci:'';var isNew=i===0&&vPage===0&&allVisits.length>prevTotal?'new':'';var fbc=v.fbclid?'<span style="color:#10b981">✅</span>':'—';var camp=v.utm_c?'<span style="color:#f59e0b;font-size:11px">'+v.utm_c+(v.utm_as?'<br><span style="color:#94a3b8">'+v.utm_as+'</span>':'')+'</span>':'—';var tg=v.vid&&window._tgMap&&window._tgMap[v.vid];var tgCell=tg?(tg.tg_user?'<a href="https://t.me/'+tg.tg_user+'" target="_blank" style="color:#3b82f6">@'+tg.tg_user+'</a>':'<span style="color:#f59e0b">'+(tg.tg_name||'—')+'</span> <span style="color:#64748b;font-size:11px">ID:'+tg.tg_id+'</span>'):'—';var isFb=v.vid;var btns=isFb?'<button class="btn grn sm" onclick="openSale(\''+v.vid+'\')">💰 Sale</button> <button class="btn sm" style="background:#8b5cf6" onclick="sendLead(\''+v.vid+'\')">👤 Lead</button> ':'';btns+='<button class="btn sm" style="background:#ef4444" onclick="delRow(\'visits\','+v.id+')">✕</button>';return'<tr class="'+isNew+'"><td>'+time(v.t)+'</td><td>'+flag+' '+v.co+city+'</td><td>'+v.d+'</td><td>'+(v.s||'Direct')+'</td><td>'+camp+'</td><td>'+fbc+'</td><td>'+tgCell+'</td><td style="white-space:nowrap">'+btns+'</td></tr>'}).join('');document.getElementById('rows').innerHTML=html||'<tr><td colspan="8" class="empty">No visits yet</td></tr>'}function renderPurchasePage(){var total=allPurchases.length;var start=pPage*PAGE;var slice=allPurchases.slice(start,start+PAGE);document.getElementById('ppag_info').textContent='Showing '+(total?start+1:0)+'-'+Math.min(start+PAGE,total)+' of '+total;document.getElementById('ppag_prev').disabled=pPage===0;document.getElementById('ppag_next').disabled=start+PAGE>=total;var phtml=slice.map(function(p){var capiStatus=p.capi_ok?'<span style="color:#10b981">✅ Sent</span>':'<span style="color:#ef4444">❌ Failed</span>';var fbc=p.fbclid?p.fbclid.slice(0,16)+'...':'—';return'<tr><td>'+time(p.t)+'</td><td><b>'+p.amount.toFixed(2)+'</b></td><td>'+p.currency+'</td><td>'+capiStatus+'</td><td>'+(p.utm_c||'—')+'</td><td>'+fbc+'</td><td><button class="btn sm" style="background:#ef4444" onclick="delRow(\'purchases\','+p.id+')">✕</button></td></tr>'}).join('');document.getElementById('prows').innerHTML=phtml||'<tr><td colspan="7" class="empty">No purchases yet</td></tr>'}function render(D){var s=D.stats;var newTotal=s.total;document.getElementById('tot').textContent=newTotal;document.getElementById('s_pur').textContent=s.purchases||0;document.getElementById('s_rev').textContent=(s.revenue||0).toFixed(2);var cr=newTotal>0?((s.purchases||0)/newTotal*100).toFixed(1)+'%':'0.0%';document.getElementById('s_cr').textContent=cr;var co={};Object.entries(s.countries||{}).forEach(function(x){co[(F[x[0]]||'🌍')+' '+x[0]]=x[1]});document.getElementById('c_co').innerHTML=bar(co,'#3b82f6');document.getElementById('c_dv').innerHTML=bar(s.devices,'#10b981');document.getElementById('c_sr').innerHTML=bar(s.sources,'#a855f7');visitMap={};(D.visits||[]).forEach(function(v){if(v.vid)visitMap[v.vid]=v});window._tgMap={};(D.tg_links||[]).forEach(function(l){if(l.vid)window._tgMap[l.vid]=l});allVisits=D.visits||[];allPurchases=D.purchases||[];allRegs=D.registrations||[];if(newTotal>prevTotal)vPage=0;updateFilters();renderVisitPage();renderPurchasePage();renderRegPage();allTgLinks=D.tg_links||[];renderTgTable();prevTotal=newTotal}async function fetchData(){var dot=document.getElementById('dot');var upd=document.getElementById('upd');try{var r=await fetch('/api/stats?key='+K);if(!r.ok)throw new Error(r.status);var d=await r.json();render(d);dot.classList.remove('err');upd.textContent='updated '+new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch(e){dot.classList.add('err');upd.textContent='error - retrying...';console.error(e)}}function renderTgTable(){var q=(document.getElementById('tg_srch')||{value:''}).value.toLowerCase();var list=allTgLinks.filter(function(l){if(!q)return true;return(l.tg_user||'').toLowerCase().includes(q)||(l.tg_name||'').toLowerCase().includes(q)||(l.tg_id||'').toString().includes(q)});var html=list.slice(0,500).map(function(l){var user=l.tg_user?'<a href="https://t.me/'+l.tg_user+'" target="_blank" style="color:#3b82f6">@'+l.tg_user+'</a>':'<span style="color:#f59e0b">'+(l.tg_name||'—')+'</span>';return'<tr><td>'+time(l.t)+'</td><td>'+user+(l.tg_name&&l.tg_user?' <span style="color:#64748b;font-size:11px">'+l.tg_name+'</span>':'')+'</td><td style="color:#94a3b8">'+l.tg_id+'</td><td style="color:#64748b">'+l.vid+'</td><td><button class="btn sm" style="background:#ef4444" onclick="delRow(\'tg_links\','+l.id+')">✕</button></td></tr>'}).join('');document.getElementById('tgrows').innerHTML=html||'<tr><td colspan="5" class="empty">No Telegram users yet</td></tr>'}async function delRow(table,id){try{await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,table:table,id:id})});fetchData()}catch(e){}}async function delAll(table){try{await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:K,table:table,all:true})});fetchData()}catch(e){}}function updateFilters(){var srcs=new Set();var cos=new Set();allVisits.forEach(function(v){srcs.add(v.s||'Direct');cos.add(v.co)});var se=document.getElementById('f_src');if(se){var cv=se.value;se.innerHTML='<option value="">All Sources</option>';Array.from(srcs).sort().forEach(function(s){se.innerHTML+='<option value="'+s+'"'+(cv===s?' selected':'')+'>'+s+'</option>'})}var ce=document.getElementById('f_co');if(ce){var ccv=ce.value;ce.innerHTML='<option value="">All Countries</option>';Array.from(cos).sort().forEach(function(c){ce.innerHTML+='<option value="'+c+'"'+(ccv===c?' selected':'')+'>'+c+'</option>'})}}fetchData();setInterval(function(){if(!document.hidden){fetchData()}},5000);document.addEventListener('visibilitychange',function(){if(!document.hidden){fetchData()}})</script></body></html>"#;
 
 // ── Auth cookie helpers (Вспомогательные функции авторизации) ─────────────────
 
@@ -582,6 +628,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     let url = req.url()?;
     let path = url.path();
     let db = env.d1("analytics_db")?;
+    let analytics_key = env.secret("ANALYTICS_KEY").map(|v| v.to_string()).unwrap_or_default();
 
     match path {
         // /analytics — дашборд (показывает если залогинен, иначе форму логина)
@@ -589,7 +636,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             if !check_auth(&req) {
                 return Response::from_html(LOGIN_PAGE);
             }
-            let html = DASH.replace("__APIKEY__", ANALYTICS_KEY);
+            let html = DASH.replace("__APIKEY__", &analytics_key);
             let mut resp = Response::from_html(&html)?;
             resp.headers_mut().set("Content-Type", "text/html; charset=utf-8")?;
             Ok(resp)
@@ -631,7 +678,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 Ok(b) => b,
                 Err(_) => return Response::error("Bad Request", 400),
             };
-            if body.key != ANALYTICS_KEY {
+            if body.key != analytics_key {
                 return Response::error("Unauthorized", 401);
             }
             let now = Date::now().as_millis() as i64;
@@ -685,7 +732,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 Ok(b) => b,
                 Err(_) => return Response::error("Bad Request", 400),
             };
-            if body.key != ANALYTICS_KEY {
+            if body.key != analytics_key {
                 return Response::error("Unauthorized", 401);
             }
             let now = Date::now().as_millis() as i64;
@@ -712,7 +759,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 Ok(b) => b,
                 Err(_) => return Response::error("Bad Request", 400),
             };
-            if body.key != ANALYTICS_KEY {
+            if body.key != analytics_key {
                 return Response::error("Unauthorized", 401);
             }
             let now = Date::now().as_millis() as i64;
@@ -752,7 +799,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 .find(|(k, _)| k == "key")
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default();
-            if key != ANALYTICS_KEY {
+            if key != analytics_key {
                 return Response::error("Unauthorized", 401);
             }
 
@@ -795,7 +842,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 Ok(b) => b,
                 Err(_) => return Response::error("Bad Request", 400),
             };
-            if body.get("key").and_then(|v| v.as_str()).unwrap_or("") != ANALYTICS_KEY {
+            if body.get("key").and_then(|v| v.as_str()).unwrap_or("") != analytics_key {
                 return Response::error("Unauthorized", 401);
             }
             let table = match body.get("table").and_then(|v| v.as_str()) {
@@ -804,20 +851,239 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             };
             let all = body.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
             if all {
-                let sql = format!("DELETE FROM {}", table);
-                d1_exec(&db, &sql, vec![]).await;
+                let sql = match table {
+                    "visits"        => "DELETE FROM visits",
+                    "purchases"     => "DELETE FROM purchases",
+                    "registrations" => "DELETE FROM registrations",
+                    "tg_links"      => "DELETE FROM tg_links",
+                    _               => return Response::error("Bad Request", 400),
+                };
+                d1_exec(&db, sql, vec![]).await;
             } else {
                 let id = match body.get("id").and_then(|v| v.as_i64()) {
                     Some(i) => i,
                     None => return Response::error("Bad Request", 400),
                 };
-                let sql = format!("DELETE FROM {} WHERE id=?", table);
-                d1_exec(&db, &sql, vec![JsValue::from_f64(id as f64)]).await;
+                let sql = match table {
+                    "visits"        => "DELETE FROM visits WHERE id=?",
+                    "purchases"     => "DELETE FROM purchases WHERE id=?",
+                    "registrations" => "DELETE FROM registrations WHERE id=?",
+                    "tg_links"      => "DELETE FROM tg_links WHERE id=?",
+                    _               => return Response::error("Bad Request", 400),
+                };
+                d1_exec(&db, sql, vec![JsValue::from_f64(id as f64)]).await;
             }
             Response::from_json(&serde_json::json!({"ok": true}))
         }
 
         // /health — проверка работоспособности воркера (возвращает "ok")
+        "/api/tg_check" => {
+            let key = url.query_pairs()
+                .find(|(k, _)| k == "key")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            if key != analytics_key {
+                return Response::error("Unauthorized", 401);
+            }
+            let tg_id_str = url.query_pairs()
+                .find(|(k, _)| k == "tg_id")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            let tg_id: i64 = tg_id_str.parse().unwrap_or(0);
+            if tg_id == 0 {
+                return Response::from_json(&serde_json::json!({"verified": false}));
+            }
+            let rows = d1_rows(&db,
+                "SELECT id, ok_mid FROM tg_links WHERE tg_id = ? LIMIT 1",
+                vec![JsValue::from_f64(tg_id as f64)],
+            ).await;
+            let verified = !rows.is_empty();
+            let ok_mid = rows.first().and_then(|r| r.get("ok_mid")).and_then(|v| v.as_i64()).unwrap_or(0);
+            Response::from_json(&serde_json::json!({"verified": verified, "ok_mid": ok_mid}))
+        }
+
+        "/app" => {
+            let html = format!(r#"<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Проверка</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#0f0f13;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}}
+.card{{max-width:360px;width:100%}}
+.check{{width:72px;height:72px;background:linear-gradient(135deg,#2AABEE,#229ED9);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 24px;font-size:36px;animation:pop .4s ease}}
+@keyframes pop{{0%{{transform:scale(0)}}70%{{transform:scale(1.15)}}100%{{transform:scale(1)}}}}
+h1{{font-size:22px;font-weight:700;margin-bottom:10px}}
+p{{color:#aaa;font-size:15px;line-height:1.5;margin-bottom:28px}}
+.spinner{{width:40px;height:40px;border:3px solid #333;border-top-color:#2AABEE;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="check">✅</div>
+  <h1>Проверка пройдена!</h1>
+  <p id="msg">Подождите...</p>
+  <div class="spinner" id="sp"></div>
+</div>
+<script>
+var tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+// Получаем cookie _vid
+function getCookie(name) {{
+  var v = document.cookie.match('(^|;) ?'+name+'=([^;]*)(;|$)');
+  return v ? v[2] : '';
+}}
+
+var initData = tg.initData;
+var vid = getCookie('_vid');
+
+if (!initData) {{
+  document.getElementById('msg').textContent = 'Ошибка: нет данных Telegram';
+  document.getElementById('sp').style.display = 'none';
+}} else {{
+  fetch('/api/webapp_verify', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{
+      init_data: initData,
+      vid: vid
+    }})
+  }})
+  .then(function(r) {{ return r.json(); }})
+  .then(function(d) {{
+    document.getElementById('sp').style.display = 'none';
+    if (d.ok) {{
+      document.getElementById('msg').textContent = 'Возвращаемся в Telegram...';
+      setTimeout(function() {{ tg.close(); }}, 1000);
+    }} else {{
+      document.getElementById('msg').textContent = 'Ошибка: ' + (d.error || 'неизвестная');
+    }}
+  }})
+  .catch(function(e) {{
+    document.getElementById('sp').style.display = 'none';
+    document.getElementById('msg').textContent = 'Ошибка соединения';
+  }});
+}}
+</script>
+</body>
+</html>"#);
+            let mut resp = Response::from_html(&html)?;
+            resp.headers_mut().set("Content-Type", "text/html; charset=utf-8")?;
+            Ok(resp)
+        }
+
+        "/api/webapp_verify" => {
+            if req.method() != Method::Post {
+                return Response::error("Method Not Allowed", 405);
+            }
+            #[derive(Deserialize)]
+            struct WebAppReq {
+                init_data: String,
+                #[serde(default)]
+                vid: String,
+            }
+            let body: WebAppReq = match req.json().await {
+                Ok(b) => b,
+                Err(_) => return Response::error("Bad Request", 400),
+            };
+            // Верифицируем initData через HMAC-SHA256 — это и есть авторизация
+            let bot_token_verify = env.secret("BOT_TOKEN").map(|v| v.to_string()).unwrap_or_default();
+            if !verify_webapp_init_data(&body.init_data, &bot_token_verify) {
+                return Response::from_json(&serde_json::json!({"ok": false, "error": "invalid init_data"}));
+            }
+            // Парсим tg_id, имя и username из initData
+            let tg_id = parse_tg_id_from_init_data(&body.init_data);
+            if tg_id == 0 {
+                return Response::from_json(&serde_json::json!({"ok": false, "error": "no tg_id"}));
+            }
+            let (tg_user, tg_name) = parse_tg_user_from_init_data(&body.init_data);
+            let now = Date::now().as_millis() as i64;
+            // Ищем vid: cookie → UA+страна за 30 минут
+            let fp_ua = hdr(req.headers(), "user-agent");
+            let fp_co = req.cf().as_ref().and_then(|cf| cf.country()).unwrap_or_default();
+            let cutoff_30m = now - 30 * 60 * 1000;
+
+            let vid = if !body.vid.is_empty() {
+                // Уровень 1: cookie
+                let rows = d1_rows(&db,
+                    "SELECT vid FROM visits WHERE vid = ? LIMIT 1",
+                    vec![JsValue::from_str(&body.vid)],
+                ).await;
+                rows.first().and_then(|r| r.get("vid")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            } else if !fp_co.is_empty() {
+                // Уровень 2: устройство (Android/iPhone) + страна за последние 30 минут
+                // UA в Mini App отличается от UA в браузере, поэтому ищем по d (тип девайса)
+                let fp_device = device(&fp_ua);
+                // Берём только платформу: Android или iPhone
+                let platform = if fp_device.contains("Android") { "Android" }
+                    else if fp_device.contains("iPhone") { "iPhone" }
+                    else { "" };
+                let rows = if !platform.is_empty() {
+                    d1_rows(&db,
+                        "SELECT vid FROM visits WHERE d LIKE ? AND co = ? AND vid != '' AND t > ? ORDER BY t DESC LIMIT 1",
+                        vec![
+                            JsValue::from_str(&format!("%{}%", platform)),
+                            JsValue::from_str(&fp_co),
+                            JsValue::from_f64(cutoff_30m as f64),
+                        ],
+                    ).await
+                } else { vec![] };
+                rows.first().and_then(|r| r.get("vid")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
+            d1_exec(&db,
+                "INSERT INTO tg_links (t, vid, tg_id, tg_user, tg_name) VALUES (?, ?, ?, ?, ?) ON CONFLICT(tg_id) DO UPDATE SET t=excluded.t, vid=CASE WHEN excluded.vid != '' THEN excluded.vid ELSE tg_links.vid END, tg_user=CASE WHEN excluded.tg_user != '' THEN excluded.tg_user ELSE tg_links.tg_user END, tg_name=CASE WHEN excluded.tg_name != '' THEN excluded.tg_name ELSE tg_links.tg_name END",
+                vec![
+                    JsValue::from_f64(now as f64),
+                    JsValue::from_str(&vid),
+                    JsValue::from_f64(tg_id as f64),
+                    JsValue::from_str(&tg_user),
+                    JsValue::from_str(&tg_name),
+                ],
+            ).await;
+            // Отправляем сообщение в бот и сохраняем ok_mid
+            let bot_token2 = env.secret("BOT_TOKEN").map(|v| v.to_string()).unwrap_or_default();
+            if !bot_token2.is_empty() {
+                #[derive(Serialize)]
+                struct TgMsg { chat_id: i64, text: &'static str, parse_mode: &'static str }
+                let msg = TgMsg { chat_id: tg_id, text: "✅ Проверка пройдена! Нажмите /start чтобы продолжить.", parse_mode: "HTML" };
+                if let Ok(body_str) = serde_json::to_string(&msg) {
+                    let headers = Headers::new();
+                    let _ = headers.set("Content-Type", "application/json");
+                    let mut init = RequestInit::new();
+                    init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&body_str)));
+                    let tg_url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token2);
+                    if let Ok(tg_req) = Request::new_with_init(&tg_url, &init) {
+                        if let Ok(mut tg_resp) = Fetch::Request(tg_req).send().await {
+                            if let Ok(tg_text) = tg_resp.text().await {
+                                let ok_mid = serde_json::from_str::<serde_json::Value>(&tg_text)
+                                    .ok()
+                                    .and_then(|v| v["result"]["message_id"].as_i64())
+                                    .unwrap_or(0);
+                                if ok_mid > 0 {
+                                    d1_exec(&db,
+                                        "UPDATE tg_links SET ok_mid = ? WHERE tg_id = ?",
+                                        vec![
+                                            JsValue::from_f64(ok_mid as f64),
+                                            JsValue::from_f64(tg_id as f64),
+                                        ],
+                                    ).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Response::from_json(&serde_json::json!({"ok": true}))
+        }
+
         "/health" => Response::ok("ok"),
 
         // /* — главный обработчик: любой другой путь = новый визит
@@ -828,165 +1094,22 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 || path.ends_with(".js") || path.ends_with(".css") {
                 return Response::error("Not Found", 404)
             }
-
-            // ── ?tg=TG_ID — линковка через кнопку в боте ─────────────────────
-            // Когда пользователь открыл бота без vid (уже был в боте раньше),
-            // бот показывает кнопку с этой ссылкой. Пользователь нажимает —
-            // мы получаем его tg_id и линкуем с последним визитом по IP.
-            let tg_param = url.query_pairs()
-                .find(|(k, _)| k == "tg")
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
-
-            if !tg_param.is_empty() {
-                // Читаем имя и username из параметров &n= и &u= (передаются ботом)
-                // Обрезаем до разумной длины и экранируем HTML
-                let user_name_raw = url.query_pairs()
-                    .find(|(k, _)| k == "n")
-                    .map(|(_, v)| v.chars().take(64).collect::<String>())
-                    .unwrap_or_default();
-                let user_name_raw = if user_name_raw.is_empty() { "друг".to_string() } else { user_name_raw };
-                let user_name = html_escape(&user_name_raw);
-                let tg_username: String = url.query_pairs()
-                    .find(|(k, _)| k == "u")
-                    .map(|(_, v)| v.chars().take(64).collect::<String>())
-                    .unwrap_or_default();
-                let mid_param: i64 = url.query_pairs()
-                    .find(|(k, _)| k == "mid")
-                    .and_then(|(_, v)| v.parse().ok())
-                    .unwrap_or(0);
-
-                if let Ok(tg_id_val) = tg_param.parse::<i64>() {
-                    let ip = hdr(req.headers(), "cf-connecting-ip");
-                    let h = hash_ip(&ip);
-                    // Ищем последний визит с этого IP (хэш)
-                    let rows = d1_rows(&db,
-                        "SELECT vid FROM visits WHERE h = ? ORDER BY t DESC LIMIT 1",
-                        vec![JsValue::from_str(&h)],
-                    ).await;
-                    let found_vid = rows.first()
-                        .and_then(|r| r.get("vid"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let now = Date::now().as_millis() as i64;
-                    d1_exec(&db,
-                        "INSERT INTO tg_links (t, vid, tg_id, tg_user, tg_name) VALUES (?, ?, ?, ?, ?) ON CONFLICT(tg_id) DO UPDATE SET t=excluded.t, vid=CASE WHEN excluded.vid IS NOT NULL AND excluded.vid != '' THEN excluded.vid ELSE tg_links.vid END, tg_user=CASE WHEN excluded.tg_user != '' THEN excluded.tg_user ELSE tg_links.tg_user END, tg_name=CASE WHEN excluded.tg_name != '' AND excluded.tg_name != 'друг' THEN excluded.tg_name ELSE tg_links.tg_name END",
-                        vec![
-                            JsValue::from_f64(now as f64),
-                            JsValue::from_str(&found_vid),
-                            JsValue::from_f64(tg_id_val as f64),
-                            JsValue::from_str(&tg_username),
-                            JsValue::from_str(&user_name_raw),
-                        ],
-                    ).await;
-
-                    // Отправляем сообщение через TG API
-                    let bot_token = env.secret("BOT_TOKEN").map(|v| v.to_string()).unwrap_or_default();
-                    if !bot_token.is_empty() {
-                        let tg_api_base = format!("https://api.telegram.org/bot{}", bot_token);
-
-                        // Удаляем сообщение с проверкой безопасности
-                        if mid_param > 0 {
-                            #[derive(Serialize)]
-                            struct DelMsg { chat_id: i64, message_id: i64 }
-                            if let Ok(body) = serde_json::to_string(&DelMsg { chat_id: tg_id_val, message_id: mid_param }) {
-                                let headers = Headers::new();
-                                let _ = headers.set("Content-Type", "application/json");
-                                let mut init = RequestInit::new();
-                                init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&body)));
-                                if let Ok(tg_req) = Request::new_with_init(&format!("{}/deleteMessage", tg_api_base), &init) {
-                                    let _ = Fetch::Request(tg_req).send().await;
-                                }
-                            }
-                        }
-
-                        // Отправляем сообщение "вы прошли проверку, нажмите /start"
-                        #[derive(Serialize)]
-                        struct TgMsg { chat_id: i64, text: String, parse_mode: &'static str }
-                        let msg = TgMsg {
-                            chat_id: tg_id_val,
-                            text: format!("✅ <b>{}</b>, проверка пройдена!\n\nНажмите /start чтобы продолжить.", user_name),
-                            parse_mode: "HTML",
-                        };
-                        if let Ok(body) = serde_json::to_string(&msg) {
-                            let headers = Headers::new();
-                            let _ = headers.set("Content-Type", "application/json");
-                            let mut init = RequestInit::new();
-                            init.with_method(Method::Post).with_headers(headers).with_body(Some(JsValue::from_str(&body)));
-                            if let Ok(tg_req) = Request::new_with_init(&format!("{}/sendMessage", tg_api_base), &init) {
-                                let _ = Fetch::Request(tg_req).send().await;
-                            }
-                        }
-                    }
-                }
-                // Страница закрывает браузер — пользователь уже получил сообщение
-                let bot = env.var("TG_BOT").map(|v| v.to_string()).unwrap_or_default();
-                let tg_deep  = format!("tg://resolve?domain={}", bot);
-                let tg_https = format!("https://t.me/{}", bot);
-                let html = format!(r#"<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Проверка пройдена</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#0f0f13;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}}
-.card{{max-width:360px;width:100%}}
-.check{{width:72px;height:72px;background:linear-gradient(135deg,#2AABEE,#229ED9);
-  border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 24px;
-  font-size:36px;animation:pop .4s ease}}
-@keyframes pop{{0%{{transform:scale(0)}}70%{{transform:scale(1.15)}}100%{{transform:scale(1)}}}}
-h1{{font-size:22px;font-weight:700;margin-bottom:10px}}
-p{{color:#aaa;font-size:15px;line-height:1.5;margin-bottom:28px}}
-.spinner{{width:40px;height:40px;border:3px solid #333;border-top-color:#2AABEE;
-  border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto 24px}}
-@keyframes spin{{to{{transform:rotate(360deg)}}}}
-.btn{{display:inline-block;background:linear-gradient(135deg,#2AABEE,#229ED9);
-  color:#fff;text-decoration:none;padding:14px 32px;border-radius:12px;
-  font-size:16px;font-weight:600;border:none;cursor:pointer;width:100%;
-  transition:opacity .2s}}
-.hint{{color:#555;font-size:13px;margin-top:16px}}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="check">✅</div>
-  <h1>Проверка пройдена!</h1>
-  <p>Возвращаемся в Telegram...</p>
-  <div class="spinner" id="sp"></div>
-  <a href="{tg_https}" class="btn" id="btn" style="display:none">Открыть Telegram</a>
-  <p class="hint" id="hint"></p>
-</div>
-<script>
-// Сначала пробуем tg:// deep link (работает на iOS и Android)
-// window.close() работает только если страница открыта через window.open()
-window.location.href="{tg_deep}";
-// Fallback: если через 2 секунды не перешли — показываем кнопку
-setTimeout(function(){{
-  try {{ window.close(); }} catch(e) {{}}
-  setTimeout(function(){{
-    document.getElementById("sp").style.display="none";
-    document.getElementById("btn").style.display="inline-block";
-    document.getElementById("hint").textContent="Если страница не закрылась — нажмите кнопку выше";
-  }},1500);
-}},500);
-</script>
-</body>
-</html>"#, tg_deep=tg_deep, tg_https=tg_https);
-                let mut headers = Headers::new();
-                headers.set("Content-Type", "text/html; charset=utf-8")?;
-                return Ok(Response::from_html(&html)?.with_headers(headers));
-            }
-
             // Читаем заголовки запроса
             let headers = req.headers();
             let ua  = hdr(headers, "user-agent");   // браузер/устройство
             let rf  = hdr(headers, "referer");       // откуда пришёл
             let ip  = hdr(headers, "cf-connecting-ip"); // IP адрес
+            let salt = env.secret("SALT").map(|v| v.to_string()).unwrap_or_default();
+            let lang = hdr(headers, "accept-language").chars().take(20).collect::<String>();
+            let platform = hdr(headers, "sec-ch-ua-platform").trim_matches('"').to_string();
+            let asn = req.cf().as_ref().and_then(|cf| cf.as_organization()).unwrap_or_default();
+            // Читаем cookie_id из куки или генерируем новый
+            let cookie_header = hdr(headers, "cookie");
+            let existing_cookie = cookie_header.split(';').find_map(|part| {
+                let p = part.trim();
+                p.strip_prefix("_vid=").map(|v| v.to_string())
+            }).unwrap_or_default();
+            let cookie_id = if !existing_cookie.is_empty() { existing_cookie.clone() } else { rand_hex(8) };
 
             // Геолокация через Cloudflare (страна и город)
             let co = req.cf().as_ref().and_then(|cf| cf.country()).unwrap_or_else(|| "??".into());
@@ -1066,7 +1189,7 @@ setTimeout(function(){{
             }
 
             let now = Date::now().as_millis() as i64;
-            let h = hash_ip(&ip);
+            let h = hash_ip(&ip, &salt);
             let ua_trunc: String = ua.chars().take(255).collect();
             let rf_trunc: String = rf.chars().take(255).collect();
             let fbclid_trunc: String = fbclid.chars().take(100).collect();
@@ -1076,7 +1199,7 @@ setTimeout(function(){{
 
             // Сохраняем визит в D1 с готовым vid
             d1_exec(&db,
-                "INSERT INTO visits (t, h, co, ci, d, s, rf, fbclid, utm_c, utm_ct, utm_as, ua, vid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO visits (t, h, co, ci, d, s, rf, fbclid, utm_c, utm_ct, utm_as, ua, vid, cookie_id, asn, lang, platform) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 vec![
                     JsValue::from_f64(now as f64),
                     JsValue::from_str(&h),
@@ -1091,6 +1214,10 @@ setTimeout(function(){{
                     JsValue::from_str(&utm_as),
                     JsValue::from_str(&ua_trunc),
                     JsValue::from_str(&vid),
+                    JsValue::from_str(&cookie_id),
+                    JsValue::from_str(&asn),
+                    JsValue::from_str(&lang),
+                    JsValue::from_str(&platform),
                 ],
             ).await;
 
@@ -1140,8 +1267,9 @@ setTimeout(function(){{
                     event_id = event_id,
                     tg_url = tg_url,
                 );
-                let mut resp = Response::from_html(&html)?;
+               let mut resp = Response::from_html(&html)?;
                 resp.headers_mut().set("Cache-Control", "no-store")?;
+                resp.headers_mut().set("Set-Cookie", &format!("_vid={}; Path=/; Max-Age=604800; SameSite=Lax", cookie_id))?;
                 Ok(resp)
             } else {
                 // Если пиксель не настроен — просто редирект в бота

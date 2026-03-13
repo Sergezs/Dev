@@ -13,6 +13,9 @@ serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 futures      = { version = "0.3", default-features = false, features = ["async-await"] }
 urlencoding  = "2"
+sha2         = "0.10"
+hmac         = "0.12"
+hex          = "0.4"
 
 # WASM-оптимизация: минимальный размер бинаря (лимит CF Workers — 1 МБ)
 [profile.release]

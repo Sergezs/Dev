@@ -7,3 +7,5 @@ command = "/home/own/.cargo/bin/worker-build --release"
 
 [vars]
 ADMIN_TG = "AdmDeva"
+PRELAND_URL = "https://comedownl.shop"
+TG_BOT = "HDevaBot"
