@@ -16,5 +16,6 @@ database_name = "analytics-db"
 database_id = "f2dc4931-14b1-435d-874a-4ceea3a35f27"
 
 [vars]
-FB_PIXEL_ID = "926011889947758"
+FB_PIXEL_ID = "2065000344044926"
 TG_BOT = "HDevaBot"
+FB_TEST_CODE = "TEST38927"
